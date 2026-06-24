@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lead Generator — OpenWeb Ninja API"""
+"""Lead Generator — OpenWeb Ninja API + ScrapeGraphAI"""
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -7,6 +7,13 @@ import requests
 import threading
 from datetime import datetime
 import os
+import json
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 try:
     import openpyxl
@@ -17,12 +24,21 @@ try:
 except ImportError:
     EXCEL_OK = False
 
+try:
+    from scrapegraphai.graphs import SmartScraperGraph
+    SCRAPE_OK = True
+except ImportError:
+    SCRAPE_OK = False
+
 # ── API credentials ──────────────────────────────────────────────────────────
 # OpenWeb Ninja direct key (ak_...) — used with X-Api-Key header
 OWN_API_KEY    = ""
 
 # RapidAPI key
 RAPIDAPI_KEY   = "644279a34bmshbda39876cdd9abcp17180bjsnfaa7d94a6b3d"
+
+# Anthropic API key for ScrapeGraphAI
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # (display label, internal key, pixel width)
 COLUMNS = [
@@ -174,6 +190,73 @@ def search_businesses(business_type: str, location: str, limit: int) -> list[dic
             errors.append(f"Connection error — {url}: {e}")
 
     raise RuntimeError("All endpoints failed.\n\n" + "\n".join(errors))
+
+
+# ───────────────────────────────────────────────────── ScrapeGraphAI ───────
+
+def scrape_leads(url: str) -> list[dict]:
+    if not SCRAPE_OK:
+        raise RuntimeError(
+            "scrapegraphai is not installed.\n"
+            "Run:  pip install scrapegraphai && playwright install"
+        )
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set.\n"
+            "Set it in a .env file or as an environment variable."
+        )
+
+    graph_config = {
+        "llm": {
+            "api_key": ANTHROPIC_API_KEY,
+            "model": "anthropic/claude-sonnet-4-6",
+        },
+        "verbose": False,
+        "headless": True,
+    }
+
+    scraper = SmartScraperGraph(
+        prompt=(
+            "Extract all business leads from this page. For each business, "
+            "extract: company name, full address, phone number, email address, "
+            "and business owner or contact person name. Return a JSON list of "
+            "objects with keys: name, address, phone, email, owner."
+        ),
+        source=url,
+        config=graph_config,
+    )
+
+    result = scraper.run()
+
+    if isinstance(result, dict):
+        for key in ("businesses", "leads", "results", "data", "items"):
+            if key in result and isinstance(result[key], list):
+                result = result[key]
+                break
+        else:
+            if "name" in result:
+                result = [result]
+            else:
+                result = list(result.values()) if result else []
+                if result and not isinstance(result[0], dict):
+                    result = []
+
+    if not isinstance(result, list):
+        result = []
+
+    normalized = []
+    for item in result:
+        if not isinstance(item, dict):
+            continue
+        normalized.append({
+            "name":    str(item.get("name") or item.get("company_name") or "").strip(),
+            "address": str(item.get("address") or item.get("full_address") or "").strip(),
+            "phone":   str(item.get("phone") or item.get("phone_number") or "").strip(),
+            "owner":   str(item.get("owner") or item.get("contact") or item.get("contact_name") or "").strip(),
+            "email":   str(item.get("email") or item.get("email_address") or "").strip(),
+        })
+
+    return normalized
 
 
 # ───────────────────────────────────────────────────────── Excel export ─────
@@ -371,6 +454,27 @@ class LeadGeneratorApp(tk.Tk):
         for e in (biz_e, loc_e):
             e.bind("<Return>", lambda _: self._on_search())
 
+        # ── scrape row ───────────────────────────────────────────────────
+        ttk.Label(sc, text="— or scrape a website directly —",
+                  style="Sub.TLabel").grid(row=2, column=0, columnspan=2,
+                                           sticky="w", pady=(10, 2))
+
+        self.url_var = tk.StringVar()
+        url_e = entry(sc, self.url_var, w=50)
+        url_e.configure(font=("Segoe UI", 10))
+        url_e.grid(row=3, column=0, columnspan=2, sticky="ew", ipady=6)
+        url_e.bind("<Return>", lambda _: self._on_scrape())
+
+        self.scrape_btn = ttk.Button(sc, text="  Scrape Website",
+                                     style="Accent.TButton",
+                                     command=self._on_scrape)
+        self.scrape_btn.grid(row=3, column=3, padx=(18, 0), sticky="w")
+
+        url_e.configure(insertontime=600)
+        url_e.delete(0, tk.END)
+        url_e.insert(0, "")
+        self.url_var.set("")
+
         # ── status row ───────────────────────────────────────────────────────
         sr = ttk.Frame(self, style="Card.TFrame", padding=(22, 5))
         sr.pack(fill="x", padx=18, pady=(3, 0))
@@ -477,6 +581,60 @@ class LeadGeneratorApp(tk.Tk):
                              f"Could not retrieve results:\n\n{msg}\n\n"
                              "Check that your API key is valid and the "
                              "endpoint path matches your plan.")
+
+    # ─────────────────────────────────────────────────── scrape logic ──────────
+
+    def _on_scrape(self):
+        url = self.url_var.get().strip()
+        if not url:
+            messagebox.showwarning("Missing URL",
+                                   "Please enter a URL to scrape.")
+            return
+        self.scrape_btn.state(["disabled"])
+        self.search_btn.state(["disabled"])
+        self.excel_btn.state(["disabled"])
+        self.status_var.set(f"Scraping {url} …")
+        self.progress.start(12)
+        self._clear_tree()
+        threading.Thread(target=self._run_scrape, args=(url,),
+                         daemon=True).start()
+
+    def _run_scrape(self, url):
+        try:
+            results = scrape_leads(url)
+            self.after(0, self._populate_scrape, results, url)
+        except Exception as exc:
+            self.after(0, self._err_scrape, str(exc))
+
+    def _populate_scrape(self, results, url):
+        self.progress.stop()
+        self.scrape_btn.state(["!disabled"])
+        self.search_btn.state(["!disabled"])
+        self.excel_btn.state(["!disabled"])
+        self._results = results
+
+        if not results:
+            self.status_var.set("No leads extracted — try a different URL.")
+            self.count_var.set("0 leads")
+            return
+
+        for i, rec in enumerate(results):
+            tag = "even" if i % 2 == 0 else "odd"
+            vals = tuple(rec.get(k, "") for _, k, _ in COLUMNS)
+            self.tree.insert("", "end", values=vals, tags=(tag,))
+
+        n = len(results)
+        self.count_var.set(f"{n} lead{'s' if n != 1 else ''} scraped")
+        self.status_var.set(f"{n} lead{'s' if n != 1 else ''} scraped from {url}")
+
+    def _err_scrape(self, msg):
+        self.progress.stop()
+        self.scrape_btn.state(["!disabled"])
+        self.search_btn.state(["!disabled"])
+        self.excel_btn.state(["!disabled"])
+        self.status_var.set("Scrape failed — see error dialog.")
+        messagebox.showerror("Scrape Error",
+                             f"Could not scrape the URL:\n\n{msg}")
 
     # ─────────────────────────────────────────────────── table helpers ────────
 
