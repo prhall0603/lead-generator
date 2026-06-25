@@ -11,7 +11,9 @@ import json
 
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    # Load .env from the script's own directory so the app works no matter
+    # what the current working directory is (e.g. launched by double-click).
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 except ImportError:
     pass
 
@@ -39,6 +41,9 @@ RAPIDAPI_KEY   = "644279a34bmshbda39876cdd9abcp17180bjsnfaa7d94a6b3d"
 
 # Anthropic API key for ScrapeGraphAI
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+
+# Shared white colour used by ttk button styles
+WHITE_STR = "#ffffff"
 
 # (display label, internal key, pixel width)
 COLUMNS = [
@@ -244,16 +249,22 @@ def scrape_leads(url: str) -> list[dict]:
     if not isinstance(result, list):
         result = []
 
+    # LLM extractions use placeholders like "NA"/"N/A"/"none" for missing
+    # values — treat those as empty so they don't leak into the table/CSV.
+    def _clean(value) -> str:
+        text = str(value or "").strip()
+        return "" if text.lower() in ("na", "n/a", "none", "null", "-") else text
+
     normalized = []
     for item in result:
         if not isinstance(item, dict):
             continue
         normalized.append({
-            "name":    str(item.get("name") or item.get("company_name") or "").strip(),
-            "address": str(item.get("address") or item.get("full_address") or "").strip(),
-            "phone":   str(item.get("phone") or item.get("phone_number") or "").strip(),
-            "owner":   str(item.get("owner") or item.get("contact") or item.get("contact_name") or "").strip(),
-            "email":   str(item.get("email") or item.get("email_address") or "").strip(),
+            "name":    _clean(item.get("name") or item.get("company_name")),
+            "address": _clean(item.get("address") or item.get("full_address")),
+            "phone":   _clean(item.get("phone") or item.get("phone_number")),
+            "owner":   _clean(item.get("owner") or item.get("contact") or item.get("contact_name")),
+            "email":   _clean(item.get("email") or item.get("email_address")),
         })
 
     return normalized
@@ -704,8 +715,6 @@ class LeadGeneratorApp(tk.Tk):
             else:
                 os.startfile(path)
 
-
-WHITE_STR = "#ffffff"   # module-level constant used by _build_ui before class body ends
 
 if __name__ == "__main__":
     app = LeadGeneratorApp()
